@@ -66,6 +66,8 @@ search conversation identifier in its memory across turns; clear the memory to
 start a new conversation. Separate chains should use separate memory instances.
 Standalone `Tool.run` calls each start a separate research run. Ctrl-C cancels
 execution rather than converting the interruption to a tool error.
+Custom memory implementations should keep `get_conversation_id()` separate from
+semantic retrieval and call `reset_conversation_id()` in their `clear()` method.
 
 ### GoogleSearchTool
 Migrated from LangChain, which is also an example for user to easily migrate any tool from 

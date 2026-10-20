@@ -14,18 +14,13 @@ from autochain.tools.base import Tool
 ENDPOINT = "https://search.parallel.ai/mcp"
 USER_AGENT = "AutoChain (https://github.com/Forethought-Technologies/AutoChain)"
 _conversation = ContextVar("autochain_parallel_conversation", default=None)
-_MEMORY_KEY = "_autochain_parallel_conversation"
 _MAX_RESPONSE = 2 * 1024 * 1024
 
 
 @contextmanager
 def search_conversation(memory):
     """Bind search identity to chain memory; clearing memory starts a new chat."""
-    session_id = memory.load_memory(_MEMORY_KEY) if memory is not None else None
-    if not session_id:
-        session_id = str(uuid4())
-        if memory is not None:
-            memory.save_memory(_MEMORY_KEY, session_id)
+    session_id = memory.get_conversation_id() if memory is not None else str(uuid4())
     token = _conversation.set(session_id)
     try:
         yield
@@ -58,27 +53,44 @@ class _Client:
                 self.session = response.headers.get("Mcp-Session-Id")
             if request_id is None:
                 return None
-            body = response.read(_MAX_RESPONSE + 1)
-            if len(body) > _MAX_RESPONSE:
-                raise ValueError("Parallel response exceeds 2 MiB")
             if "text/event-stream" in response.headers.get("Content-Type", ""):
-                # Each SSE event carries one JSON-RPC message; ignore notifications.
-                messages = []
-                for event in body.decode().replace("\r\n", "\n").split("\n\n"):
-                    data = "\n".join(
-                        line[5:].lstrip(" ")
-                        for line in event.splitlines()
-                        if line.startswith("data:")
-                    )
-                    if data:
-                        messages.append(json.loads(data))
+                # Stop at the matching event even if the server keeps SSE open.
+                size, data = 0, []
+                result = None
+                while size <= _MAX_RESPONSE:
+                    line = response.readline(_MAX_RESPONSE - size + 1)
+                    size += len(line)
+                    if size > _MAX_RESPONSE:
+                        raise ValueError("Parallel response exceeds 2 MiB")
+                    if not line:
+                        break
+                    text = line.decode().rstrip("\r\n")
+                    if text.startswith("data:"):
+                        data.append(text[5:].lstrip(" "))
+                    elif not text and data:
+                        message = json.loads("\n".join(data))
+                        data = []
+                        if (
+                            isinstance(message, dict)
+                            and message.get("id") == request_id
+                        ):
+                            result = message
+                            break
             else:
-                messages = [json.loads(body)]
-            result = next((m for m in messages if m.get("id") == request_id), None)
-            if not result or result.get("jsonrpc") != "2.0":
+                body = response.read(_MAX_RESPONSE + 1)
+                if len(body) > _MAX_RESPONSE:
+                    raise ValueError("Parallel response exceeds 2 MiB")
+                result = json.loads(body)
+            if (
+                not isinstance(result, dict)
+                or result.get("id") != request_id
+                or result.get("jsonrpc") != "2.0"
+            ):
                 raise ValueError("Invalid Parallel MCP response")
             if "error" in result:
                 raise ValueError("Parallel MCP returned an error")
+            if not isinstance(result.get("result"), dict):
+                raise ValueError("Invalid Parallel MCP result")
             return result["result"]
 
     def call(self, name, arguments):

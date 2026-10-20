@@ -1,9 +1,14 @@
+import importlib.util
 import json
+import sys
+import types
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from io import BytesIO
+from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError, URLError
+from uuid import UUID
 
 import pytest
 from autochain.agent.conversational_agent.conversational_agent import (
@@ -14,12 +19,16 @@ from autochain.agent.openai_functions_agent.openai_functions_agent import (
     OpenAIFunctionsAgent,
 )
 from autochain.chain.chain import Chain
+from autochain.memory import base as memory_module
 from autochain.memory.buffer_memory import BufferMemory
+from autochain.memory.redis_memory import RedisMemory
 from autochain.models.base import BaseLanguageModel, Generation, LLMResult
 from autochain.models.chat_openai import convert_tool_to_dict
 from autochain.tools.base import Tool
+from autochain.tools.internal_search.base_search_tool import BaseSearchTool
 from autochain.tools.parallel_search import ENDPOINT, USER_AGENT, parallel_search_tools
 from pydantic import PrivateAttr
+from redis import Redis
 
 
 class ScriptedModel(BaseLanguageModel):
@@ -109,7 +118,17 @@ def mcp_server(failure=None, sse=False):
                 + payload
                 + "\n\n"
             )
-        response = BytesIO(payload.encode())
+
+        class OpenEventStream(BytesIO):
+            def readline(self, size=-1):
+                line = super().readline(size)
+                if not line:
+                    raise TimeoutError("SSE connection remains open after the result")
+                return line
+
+        response = (
+            OpenEventStream(payload.encode()) if sse else BytesIO(payload.encode())
+        )
         response.headers = {
             "Mcp-Session-Id": "transport-session",
             "Content-Type": "text/event-stream" if sse else "application/json",
@@ -331,3 +350,98 @@ def test_conversational_agent_consumes_search_results():
         result = chain.run("Find Python documentation")
         assert "Python documentation https://docs.python.org/3/" in result["message"]
         assert len(tool_calls(captured)) == 1
+
+
+def test_long_term_memory_never_retrieves_conversation_metadata():
+    # Load the actual memory implementation without unrelated optional DB SDKs.
+    backend_modules = {}
+    for module_name, search_name, doc_name in [
+        ("chromadb_tool", "ChromaDBSearch", "ChromaDoc"),
+        ("pinecone_tool", "PineconeSearch", "PineconeDoc"),
+        ("lancedb_tool", "LanceDBSeach", "LanceDBDoc"),
+    ]:
+        name = "autochain.tools.internal_search." + module_name
+        module = types.ModuleType(name)
+        setattr(module, search_name, type(search_name, (BaseSearchTool,), {}))
+        setattr(module, doc_name, type(doc_name, (), {}))
+        backend_modules[name] = module
+    spec = importlib.util.spec_from_file_location(
+        "_tested_long_term_memory",
+        Path(memory_module.__file__).with_name("long_term_memory.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    with mock.patch.dict(sys.modules, backend_modules):
+        spec.loader.exec_module(module)
+
+    class Backend(BaseSearchTool):
+        _queries = PrivateAttr(default_factory=list)
+
+        def _run(self, query, top_k=1):
+            return self.run({"query": query, "top_k": top_k})
+
+        def add_docs(self, docs, **kwargs):
+            pass
+
+        def run(self, arguments):
+            self._queries.append(arguments["query"])
+            if arguments["query"] == "intermediate_steps":
+                return []
+            return "Doc 0: private customer information"
+
+        def clear_index(self):
+            pass
+
+    memory = module.LongTermMemory(long_term_memory=Backend())
+    agent = OpenAIFunctionsAgent.from_llm_and_tools(llm=OneToolModel())
+    chain = Chain(agent=agent, memory=memory)
+    with mcp_server() as captured:
+        assert "Python documentation" in chain.run("Research")["message"]
+        first = tool_calls(captured)[0]["arguments"]["session_id"]
+        assert str(UUID(first)) == first
+        assert (
+            "_autochain_parallel_conversation" not in memory.long_term_memory._queries
+        )
+        assert all(
+            not query.startswith("_autochain")
+            for query in memory.long_term_memory._queries
+        )
+        memory.clear()
+        chain.run("New conversation")
+        assert tool_calls(captured)[-1]["arguments"]["session_id"] != first
+
+
+def test_redis_conversations_persist_and_reset_without_sharing_identity():
+    import fnmatch
+
+    store = {}
+    client = mock.MagicMock(spec=Redis)
+    client.get.side_effect = store.get
+
+    def put(key, value, **kwargs):
+        store[key] = value.encode() if isinstance(value, str) else value
+
+    client.set.side_effect = put
+    client.keys.side_effect = lambda pattern: [
+        k for k in store if fnmatch.fnmatch(k, pattern)
+    ]
+    client.delete.side_effect = lambda key: store.pop(key, None)
+    shared_tools = parallel_search_tools()
+    chains = [
+        Chain(
+            agent=OpenAIFunctionsAgent.from_llm_and_tools(
+                llm=OneToolModel(), tools=shared_tools
+            ),
+            memory=RedisMemory(redis_key_prefix=prefix, redis_client=client),
+        )
+        for prefix in ["conversation-one", "conversation-two"]
+    ]
+    with mcp_server() as captured:
+        for chain in chains:
+            chain.run("Research")
+        ids = [c["arguments"]["session_id"] for c in tool_calls(captured)]
+        assert len(set(ids)) == 2
+        resumed = RedisMemory(redis_key_prefix="conversation-one", redis_client=client)
+        assert resumed.get_conversation_id() == ids[0]
+        chains[0].memory.clear()
+        chains[0].run("New chat")
+        assert tool_calls(captured)[-1]["arguments"]["session_id"] not in ids
