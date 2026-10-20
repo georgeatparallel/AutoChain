@@ -200,6 +200,7 @@ def test_interleaved_chains_share_tools_but_not_conversation_identity():
         (URLError("offline"), "failed or timed out"),
         (TimeoutError(), "failed or timed out"),
     ],
+    ids=["quota", "authentication", "network", "timeout"],
 )
 def test_agent_consumes_errors_without_provider_fallback(failure, expected):
     chain = make_chain()
@@ -209,7 +210,9 @@ def test_agent_consumes_errors_without_provider_fallback(failure, expected):
 
 
 @pytest.mark.parametrize(
-    "failure", [TimeoutError(), HTTPError(ENDPOINT, 429, "Quota", {}, None)]
+    "failure",
+    [TimeoutError(), HTTPError(ENDPOINT, 429, "Quota", {}, None)],
+    ids=["timeout", "quota"],
 )
 def test_retry_retains_conversation_and_cancel_propagates(failure):
     chain = make_chain()
